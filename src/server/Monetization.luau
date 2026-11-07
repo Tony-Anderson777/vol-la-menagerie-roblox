@@ -110,7 +110,7 @@ function Monetization.start(game_)
 		local name = Config.displayName(creatureId, mutationId)
 		local freeSlot = game_.findFreeSlot(base, player)
 		if freeSlot then
-			game_.placeCreature(base, freeSlot, creatureId, mutationId, true)
+			game_.placeCreature(base, freeSlot, creatureId, mutationId, nil, true)
 			notify(player, "🥚 L'œuf a éclos : " .. name .. " !", "success")
 			game_.notifyAll("🥚 " .. player.DisplayName .. " a obtenu " .. name .. " dans un Œuf mystère !", "info")
 		else
@@ -122,27 +122,35 @@ function Monetization.start(game_)
 	end)
 
 	-- Roblox appelle cette fonction à chaque achat de produit.
-	-- Elle doit renvoyer PurchaseGranted UNIQUEMENT si le joueur a bien reçu son achat.
+	-- On ne renvoie PurchaseGranted QUE quand la récompense ET le reçu sont enregistrés
+	-- dans le DataStore. Sinon Roblox rappellera cette fonction plus tard (même après
+	-- une reconnexion), et on réessaiera de sauvegarder.
 	MarketplaceService.ProcessReceipt = function(receipt)
 		local player = Players:GetPlayerByUserId(receipt.PlayerId)
 		if not player or not PlayerData.get(player) or not sessions[player] then
 			return Enum.ProductPurchaseDecision.NotProcessedYet
 		end
-		if PlayerData.hasReceipt(player, receipt.PurchaseId) then
-			return Enum.ProductPurchaseDecision.PurchaseGranted -- déjà livré
+
+		if not PlayerData.hasReceipt(player, receipt.PurchaseId) then
+			local handler = productHandlers[receipt.ProductId]
+			if not handler then
+				warn("[Monetization] Produit inconnu : " .. tostring(receipt.ProductId))
+				return Enum.ProductPurchaseDecision.NotProcessedYet
+			end
+			local ok, err = pcall(handler, player)
+			if not ok then
+				warn("[Monetization] Erreur en livrant un achat : " .. tostring(err))
+				return Enum.ProductPurchaseDecision.NotProcessedYet
+			end
+			-- Récompense et reçu sont maintenant dans les données en mémoire, ensemble
+			PlayerData.addReceipt(player, receipt.PurchaseId)
 		end
-		local handler = productHandlers[receipt.ProductId]
-		if not handler then
-			warn("[Monetization] Produit inconnu : " .. tostring(receipt.ProductId))
+
+		-- Déjà livré en mémoire (cet appel ou un précédent) : il faut que ce soit sauvegardé.
+		if not PlayerData.save(player) then
+			warn("[Monetization] Sauvegarde ratée après l'achat " .. tostring(receipt.PurchaseId) .. ", on réessaiera")
 			return Enum.ProductPurchaseDecision.NotProcessedYet
 		end
-		local ok, err = pcall(handler, player)
-		if not ok then
-			warn("[Monetization] Erreur en livrant un achat : " .. tostring(err))
-			return Enum.ProductPurchaseDecision.NotProcessedYet
-		end
-		PlayerData.addReceipt(player, receipt.PurchaseId)
-		PlayerData.save(player)
 		game_.pushState(player)
 		return Enum.ProductPurchaseDecision.PurchaseGranted
 	end

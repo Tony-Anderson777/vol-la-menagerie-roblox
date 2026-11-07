@@ -10,6 +10,7 @@
 -- change de serveur très vite.
 
 local DataStoreService = game:GetService("DataStoreService")
+local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -31,8 +32,11 @@ local function newDefaultData()
 	return {
 		version = CURRENT_VERSION,
 		coins = Config.STARTING_COINS,
-		creatures = {}, -- ["1"] = { id = "grenouille", mut = "normal" }
+		creatures = {}, -- ["1"] = { id = "grenouille", mut = "normal", uid = "..." }
 		receipts = {}, -- achats Robux déjà livrés (évite de donner 2 fois)
+		pendingCash = 0, -- argent gagné dans la base mais pas encore récupéré sur la plaque
+		outgoing = {}, -- créatures volées en cours de transfert : [uid] = { to, id, mut }
+		returned = {}, -- créatures à rendre au joueur (transfert de vol interrompu)
 	}
 end
 
@@ -55,6 +59,12 @@ local function migrate(data)
 	for key, value in defaults do
 		if data[key] == nil then
 			data[key] = value
+		end
+	end
+	-- Chaque créature a un identifiant unique (sert à suivre les vols)
+	for _, creature in data.creatures do
+		if not creature.uid then
+			creature.uid = HttpService:GenerateGUID(false)
 		end
 	end
 	return data
@@ -100,10 +110,55 @@ local function keyFor(userId)
 	return "joueur_" .. tostring(userId)
 end
 
+-- Libère juste le verrou (quand le joueur part pendant son chargement).
+local function releaseLockOnly(key)
+	withRetry(2, function()
+		store:UpdateAsync(key, function(old)
+			if old and old.lock and old.lock.jobId == JOB_ID then
+				old.lock = nil
+				return old
+			end
+			return nil
+		end)
+	end)
+end
+
+-- Vérifie les créatures volées dont le transfert a pu être interrompu (voir GameServer).
+-- Si le voleur n'a jamais sauvegardé la créature et n'est plus en jeu, elle revient au joueur.
+local function resolveOutgoing(data)
+	for uid, transfer in data.outgoing do
+		local ok, stored = withRetry(2, function()
+			return store:GetAsync(keyFor(transfer.to))
+		end)
+		if ok then
+			local thiefData = stored and stored.data
+			local received = false
+			if thiefData and thiefData.creatures then
+				for _, creature in thiefData.creatures do
+					if creature.uid == uid then
+						received = true
+						break
+					end
+				end
+			end
+			local thiefLock = stored and stored.lock
+			local thiefActive = thiefLock ~= nil and os.time() - thiefLock.time < LOCK_TIMEOUT
+			if received then
+				data.outgoing[uid] = nil -- le transfert est bien terminé
+			elseif not thiefActive then
+				-- Le voleur ne l'a jamais reçue : on la rend
+				table.insert(data.returned, { id = transfer.id, mut = transfer.mut, uid = uid })
+				data.outgoing[uid] = nil
+			end
+			-- Sinon le voleur est encore en jeu : on revérifiera au prochain chargement.
+		end
+	end
+end
+
 -- Charge les données. Renvoie la table de données, ou nil si le joueur a été expulsé.
 function PlayerData.load(player)
 	if not store then
-		profiles[player] = { data = newDefaultData(), canSave = false, released = false }
+		profiles[player] = { data = migrate(newDefaultData()), canSave = false, released = false }
 		return profiles[player].data
 	end
 
@@ -127,14 +182,18 @@ function PlayerData.load(player)
 		end)
 
 		if not player.Parent then
-			return nil -- le joueur est parti pendant le chargement
+			-- Le joueur est parti pendant le chargement : on rend le verrou tout de suite
+			if ok and stored and not lockedByOther then
+				releaseLockOnly(key)
+			end
+			return nil
 		end
 
 		if not ok then
 			if RunService:IsStudio() then
 				-- Dans Studio sans "Accès aux services API", on joue quand même, sans sauvegarde.
 				warn("[PlayerData] Pas de sauvegarde dans ce test Studio (active l'accès aux services API).")
-				profiles[player] = { data = newDefaultData(), canSave = false, released = false }
+				profiles[player] = { data = migrate(newDefaultData()), canSave = false, released = false }
 				return profiles[player].data
 			end
 			player:Kick("Impossible de charger ta progression. Reviens dans un instant !")
@@ -144,7 +203,13 @@ function PlayerData.load(player)
 		if not lockedByOther and stored then
 			local okMigrate, data = pcall(migrate, stored.data or newDefaultData())
 			if not okMigrate then
+				releaseLockOnly(key)
 				player:Kick("Erreur de données. Reviens dans un instant !")
+				return nil
+			end
+			resolveOutgoing(data)
+			if not player.Parent then
+				releaseLockOnly(key)
 				return nil
 			end
 			profiles[player] = { data = data, canSave = true, released = false }
@@ -164,16 +229,32 @@ function PlayerData.get(player)
 	return profile and profile.data
 end
 
-local function write(player, releaseLock)
-	local profile = profiles[player]
-	if not profile or not profile.canSave or not store then
+-- Écrit les données. Les écritures d'un même joueur passent une par une, dans l'ordre,
+-- et plus rien n'est écrit après la sauvegarde finale (celle qui libère le verrou).
+-- Renvoie true seulement si les données sont vraiment enregistrées.
+local function write(profile, userId, releaseLock)
+	if not profile.canSave or not store then
 		return true
 	end
+	if profile.finished or (profile.released and not releaseLock) then
+		return false
+	end
 	activeWrites += 1
-	local key = keyFor(player.UserId)
+	while profile.writing do
+		task.wait(0.1)
+	end
+	if profile.finished or (profile.released and not releaseLock) then
+		activeWrites -= 1
+		return false
+	end
+	profile.writing = true
+
+	local aborted = false
 	local ok = withRetry(3, function()
-		store:UpdateAsync(key, function(old)
+		store:UpdateAsync(keyFor(userId), function(old)
+			aborted = false
 			if old and old.lock and old.lock.jobId ~= JOB_ID and not RunService:IsStudio() then
+				aborted = true
 				return nil -- un autre serveur a pris la main : on n'écrase rien
 			end
 			local newLock = nil
@@ -183,12 +264,24 @@ local function write(player, releaseLock)
 			return { data = profile.data, lock = newLock }
 		end)
 	end)
+
+	if releaseLock then
+		profile.finished = true
+	end
+	profile.writing = false
 	activeWrites -= 1
-	return ok
+	if aborted then
+		warn("[PlayerData] Sauvegarde refusée : un autre serveur a pris les données de " .. userId)
+	end
+	return ok and not aborted
 end
 
 function PlayerData.save(player)
-	return write(player, false)
+	local profile = profiles[player]
+	if not profile then
+		return false
+	end
+	return write(profile, player.UserId, false)
 end
 
 -- Sauvegarde une dernière fois et libère le verrou (quand le joueur part).
@@ -198,8 +291,10 @@ function PlayerData.release(player)
 		return
 	end
 	profile.released = true
-	write(player, true)
-	profiles[player] = nil
+	write(profile, player.UserId, true)
+	if profiles[player] == profile then
+		profiles[player] = nil
+	end
 end
 
 -- Achats Robux déjà livrés

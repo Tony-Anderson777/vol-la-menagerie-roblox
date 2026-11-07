@@ -7,6 +7,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 local Workspace = game:GetService("Workspace")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
@@ -348,7 +349,6 @@ for index, center in BASE_CENTERS do
 		model = model,
 		owner = nil,
 		slots = {},
-		pending = 0,
 		shieldUntil = 0,
 		lockReadyAt = 0,
 	}
@@ -388,7 +388,15 @@ for index, center in BASE_CENTERS do
 				Material = Enum.Material.SmoothPlastic,
 				Parent = model,
 			})
-			table.insert(base.slots, { pad = pad, creatureId = nil, mutation = nil, model = nil, stolenBy = nil })
+			table.insert(base.slots, {
+				pad = pad,
+				creatureId = nil,
+				mutation = nil,
+				uid = nil, -- identifiant unique de la créature (sert à suivre les vols)
+				model = nil,
+				stolenBy = nil,
+				transferring = false, -- vrai pendant l'enregistrement d'un vol réussi
+			})
 		end
 	end
 
@@ -565,7 +573,7 @@ local function setCreaturePromptsOwner(model, ownerId)
 	end
 end
 
-local function placeCreature(base, slotIndex, creatureId, mutationId, saveToData)
+local function placeCreature(base, slotIndex, creatureId, mutationId, uid, saveToData)
 	local slot = base.slots[slotIndex]
 	if slot.model then
 		slot.model:Destroy()
@@ -589,13 +597,15 @@ local function placeCreature(base, slotIndex, creatureId, mutationId, saveToData
 
 	slot.creatureId = creatureId
 	slot.mutation = mutationId
+	slot.uid = uid or HttpService:GenerateGUID(false)
 	slot.model = model
 	slot.stolenBy = nil
+	slot.transferring = false
 
 	if saveToData and base.owner then
 		local data = PlayerData.get(base.owner)
 		if data then
-			data.creatures[tostring(slotIndex)] = { id = creatureId, mut = mutationId }
+			data.creatures[tostring(slotIndex)] = { id = creatureId, mut = mutationId, uid = slot.uid }
 		end
 	end
 end
@@ -608,7 +618,9 @@ local function clearSlot(base, slotIndex, saveToData)
 	slot.model = nil
 	slot.creatureId = nil
 	slot.mutation = nil
+	slot.uid = nil
 	slot.stolenBy = nil
+	slot.transferring = false
 	if saveToData and base.owner then
 		local data = PlayerData.get(base.owner)
 		if data then
@@ -636,6 +648,70 @@ local function applyWalkSpeed(player)
 	end
 end
 
+-- Transfert d'une créature volée, dans un ordre qui permet de réparer une coupure :
+--  1. on l'enlève au volé et on note le transfert en cours (outgoing), puis on sauvegarde le volé ;
+--  2. seulement si ça a marché, on l'ajoute au voleur et on le sauvegarde ;
+--  3. ensuite on efface la note chez le volé.
+-- Si le serveur s'arrête entre 1 et 2, PlayerData rend la créature au volé à son retour
+-- (le voleur ne l'a jamais eue dans sa sauvegarde) : ni duplication, ni perte.
+local function commitStolenCreature(victim, victimBase, victimSlotIndex, thief, thiefBase, thiefSlotIndex)
+	local victimSlot = victimBase.slots[victimSlotIndex]
+	local creatureId, mutationId, uid = victimSlot.creatureId, victimSlot.mutation, victimSlot.uid
+
+	local victimData = PlayerData.get(victim)
+	if victimData then
+		victimData.outgoing[uid] = { to = thief.UserId, id = creatureId, mut = mutationId }
+	end
+	clearSlot(victimBase, victimSlotIndex, true)
+
+	-- Le voleur voit tout de suite la créature, mais ne peut ni la vendre ni se la faire voler
+	-- tant que le transfert n'est pas enregistré.
+	placeCreature(thiefBase, thiefSlotIndex, creatureId, mutationId, uid, false)
+	local thiefSlot = thiefBase.slots[thiefSlotIndex]
+	thiefSlot.transferring = true
+
+	task.spawn(function()
+		-- Étape 1 : le volé (s'il est parti entre-temps, sa sauvegarde finale contient déjà le transfert)
+		local victimSaved = PlayerData.save(victim) or PlayerData.get(victim) == nil
+		local stillReserved = thiefBase.owner == thief and thiefSlot.uid == uid
+		local thiefData = PlayerData.get(thief)
+
+		if victimSaved and stillReserved and thiefData then
+			-- Étape 2 : le voleur
+			thiefData.creatures[tostring(thiefSlotIndex)] = { id = creatureId, mut = mutationId, uid = uid }
+			thiefSlot.transferring = false
+			if PlayerData.save(thief) then
+				-- Étape 3 : le transfert est terminé
+				local data = PlayerData.get(victim)
+				if data then
+					data.outgoing[uid] = nil
+				end
+			end
+			pushState(thief)
+			return
+		end
+
+		-- Échec : on annule et la créature revient au volé
+		if stillReserved then
+			clearSlot(thiefBase, thiefSlotIndex, false)
+		end
+		local data = PlayerData.get(victim)
+		if data then
+			data.outgoing[uid] = nil
+			local backSlot = victimBase.owner == victim and findFreeSlot(victimBase, victim)
+			if backSlot then
+				placeCreature(victimBase, backSlot, creatureId, mutationId, uid, true)
+			else
+				table.insert(data.returned, { id = creatureId, mut = mutationId, uid = uid })
+			end
+			notify(victim, "😮‍💨 " .. Config.displayName(creatureId, mutationId) .. " est revenu chez toi.", "info")
+		end
+		notify(thief, "Le vol n'a pas pu être enregistré, la créature est rendue.", "danger")
+		pushState(thief)
+		pushState(victim)
+	end)
+end
+
 local function endSteal(thief, success, reason)
 	local steal = steals[thief]
 	if not steal then
@@ -653,20 +729,19 @@ local function endSteal(thief, success, reason)
 		return
 	end
 
-	local creatureId, mutationId = slot.creatureId, slot.mutation
+	local creatureId, mutationId, uid = slot.creatureId, slot.mutation, slot.uid
 	local name = Config.displayName(creatureId, mutationId)
 	local thiefSession = sessions[thief]
 	local thiefBase = thiefSession and thiefSession.base
 	local freeSlot = thiefBase and findFreeSlot(thiefBase, thief)
 
 	if success and freeSlot then
-		clearSlot(base, steal.slotIndex, true)
-		placeCreature(thiefBase, freeSlot, creatureId, mutationId, true)
+		commitStolenCreature(steal.victim, base, steal.slotIndex, thief, thiefBase, freeSlot)
 		notify(thief, "🎉 Tu as volé " .. name .. " !", "success")
 		notify(steal.victim, "😱 " .. thief.DisplayName .. " t'a volé " .. name .. " !", "danger")
 	else
 		-- La créature retourne à sa place
-		placeCreature(base, steal.slotIndex, creatureId, mutationId, false)
+		placeCreature(base, steal.slotIndex, creatureId, mutationId, uid, false)
 		if reason == "caught" then
 			notify(thief, "🚨 " .. steal.victim.DisplayName .. " t'a attrapé ! La créature est rendue.", "danger")
 			notify(steal.victim, "💪 Tu as récupéré " .. name .. " !", "success")
@@ -693,7 +768,7 @@ onStealPrompt = function(thief, base, slotIndex, model)
 	if base.owner == nil or base.owner == thief then
 		return
 	end
-	if slot.model ~= model or not slot.creatureId or slot.stolenBy then
+	if slot.model ~= model or not slot.creatureId or slot.stolenBy or slot.transferring then
 		return
 	end
 	if steals[thief] then
@@ -733,7 +808,7 @@ end
 
 onSellPrompt = function(player, base, slotIndex, model)
 	local slot = base.slots[slotIndex]
-	if base.owner ~= player or slot.model ~= model or not slot.creatureId or slot.stolenBy then
+	if base.owner ~= player or slot.model ~= model or not slot.creatureId or slot.stolenBy or slot.transferring then
 		return
 	end
 	local value = math.floor(Config.priceOf(slot.creatureId, slot.mutation) * Config.SELL_RATIO)
@@ -776,7 +851,7 @@ local function onBuyPrompt(player, item)
 	item.sold = true
 	item.model:Destroy()
 	setCoins(player, data.coins - price)
-	placeCreature(session.base, freeSlot, item.creatureId, item.mutation, true)
+	placeCreature(session.base, freeSlot, item.creatureId, item.mutation, nil, true)
 	notify(player, "✅ " .. Config.displayName(item.creatureId, item.mutation) .. " est dans ta base !", "success")
 
 	local def = Config.CreaturesById[item.creatureId]
@@ -876,11 +951,15 @@ end)
 -- Revenus, collecte, verrou
 ---------------------------------------------------------------------
 local function collect(base, player)
-	local amount = math.floor(base.pending)
+	local data = PlayerData.get(player)
+	if not data then
+		return
+	end
+	local amount = math.floor(data.pendingCash)
 	if amount < 1 then
 		return
 	end
-	base.pending -= amount
+	data.pendingCash -= amount
 	addCoins(player, amount)
 	base.pendingLabel.Text = "💰 0"
 	notify(player, "+" .. format(amount) .. " 🪙", "coins")
@@ -919,9 +998,13 @@ task.spawn(function()
 		task.wait(1)
 		local now = os.clock()
 		for _, base in bases do
-			if base.owner then
-				base.pending += baseIncome(base)
-				base.pendingLabel.Text = "💰 " .. format(base.pending) .. "\n<font size=\"14\">Marche ici pour récupérer</font>"
+			local ownerData = base.owner and PlayerData.get(base.owner)
+			if ownerData then
+				-- La cagnotte est dans les données du joueur : elle est sauvegardée avec le reste
+				ownerData.pendingCash += baseIncome(base)
+				base.pendingLabel.Text = "💰 "
+					.. format(ownerData.pendingCash)
+					.. "\n<font size=\"14\">Marche ici pour récupérer</font>"
 
 				local shieldLeft = base.shieldUntil - now
 				base.dome.Transparency = if shieldLeft > 0 then 0.6 else 1
@@ -975,24 +1058,41 @@ local function onPlayerAdded(player)
 
 	-- Game passes déjà achetés
 	session.passes = Monetization.loadPasses(player)
+	if not player.Parent or sessions[player] ~= session then
+		return -- le joueur est parti pendant la vérification : PlayerRemoving a déjà tout nettoyé
+	end
 
 	-- On donne une base libre au joueur
 	for _, base in bases do
 		if base.owner == nil then
 			base.owner = player
 			session.base = base
-			base.pending = 0
 			base.shieldUntil = 0
 			base.lockReadyAt = 0
+			base.pendingLabel.Text = "💰 " .. format(data.pendingCash)
 			base.signLabel.Text = "Base de " .. player.DisplayName
 			base.lockPrompt:SetAttribute("OwnerId", player.UserId)
 			refreshPadColors(base)
 			for slotKey, saved in data.creatures do
 				local slotIndex = tonumber(slotKey)
 				if slotIndex and base.slots[slotIndex] and Config.CreaturesById[saved.id] then
-					placeCreature(base, slotIndex, saved.id, saved.mut or "normal", false)
+					placeCreature(base, slotIndex, saved.id, saved.mut or "normal", saved.uid, false)
 				end
 			end
+			-- Créatures rendues après un vol interrompu
+			for _, returned in data.returned do
+				local name = Config.displayName(returned.id, returned.mut)
+				local freeSlot = findFreeSlot(base, player)
+				if freeSlot then
+					placeCreature(base, freeSlot, returned.id, returned.mut, returned.uid, true)
+					notify(player, "😮‍💨 " .. name .. " est revenu chez toi.", "info")
+				else
+					local value = Config.priceOf(returned.id, returned.mut)
+					addCoins(player, value)
+					notify(player, name .. " est revenu, mais ta base est pleine : +" .. format(value) .. " 🪙", "info")
+				end
+			end
+			data.returned = {}
 			break
 		end
 	end
@@ -1023,12 +1123,10 @@ local function onPlayerRemoving(player)
 	local session = sessions[player]
 	if session and session.base then
 		local base = session.base
-		addCoins(player, math.floor(base.pending)) -- on ne perd pas l'argent non récupéré
 		for slotIndex in base.slots do
 			clearSlot(base, slotIndex, false)
 		end
 		base.owner = nil
-		base.pending = 0
 		base.shieldUntil = 0
 		base.dome.Transparency = 1
 		base.signLabel.Text = "Base libre"

@@ -202,7 +202,7 @@ Pour activer la sauvegarde :
 
 Dans le vrai jeu publié, la sauvegarde marche toujours, sans rien faire.
 
-**Ce qui est sauvegardé :** les pièces et les créatures de la base. L'argent pas encore récupéré sur la plaque verte est ajouté automatiquement quand le joueur quitte.
+**Ce qui est sauvegardé :** les pièces, les créatures de la base et l'argent pas encore récupéré sur la plaque verte (il t'attend à ton retour). Les achats Robux ne sont confirmés qu'une fois sauvegardés, et un vol interrompu par une panne de serveur ne duplique ni ne fait disparaître la créature.
 
 ---
 
