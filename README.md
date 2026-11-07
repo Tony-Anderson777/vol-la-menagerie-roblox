@@ -1,6 +1,6 @@
 # 🐾 Vole la Ménagerie
 
-> **État du dépôt : documentation initiale uniquement.** Les scripts Luau et le fichier `default.project.json` décrits ci-dessous ne sont pas encore importés. Les fonctionnalités annoncées dans le document fourni restent à vérifier après ajout du code et tests dans Roblox Studio ; ce dépôt ne contient pas encore de jeu exécutable.
+> **État du dépôt :** tout le code du jeu est présent (voir [Ce qui est déjà dans le jeu](#-ce-qui-est-déjà-dans-le-jeu)), mais il **n'a encore jamais été lancé dans Roblox Studio** ni vérifié avec un outil d'analyse Luau. Les fonctionnalités sont écrites, pas encore validées. Ce qui reste à faire est listé dans [Reste à faire](#-reste-à-faire).
 
 Un jeu Roblox où tu collectionnes des créatures rigolotes, où elles te font gagner de l'argent... et où les autres joueurs peuvent venir te les voler !
 
@@ -22,8 +22,9 @@ Un jeu Roblox où tu collectionnes des créatures rigolotes, où elles te font g
 10. [Gagner des Robux (monétisation)](#-gagner-des-robux-monétisation)
 11. [Personnaliser le jeu](#-personnaliser-le-jeu)
 12. [Problèmes fréquents](#-problèmes-fréquents)
-13. [Idées pour la suite](#-idées-pour-la-suite)
-14. [Comment on travaille sur ce dépôt](#-comment-on-travaille-sur-ce-dépôt)
+13. [Reste à faire](#-reste-à-faire)
+14. [Idées pour la suite](#-idées-pour-la-suite)
+15. [Comment on travaille sur ce dépôt](#-comment-on-travaille-sur-ce-dépôt)
 
 ---
 
@@ -57,6 +58,8 @@ Un jeu Roblox où tu collectionnes des créatures rigolotes, où elles te font g
 
 ## ✅ Ce qui est déjà dans le jeu
 
+Tout ceci est **écrit dans le code**, mais doit encore être **vérifié dans Studio** :
+
 - Carte construite automatiquement par le code : tapis roulant, 6 bases avec murs, panneaux, emplacements.
 - Tapis roulant avec des créatures aléatoires (raretés et mutations).
 - Achat, placement dans la base, revente.
@@ -75,7 +78,7 @@ Un jeu Roblox où tu collectionnes des créatures rigolotes, où elles te font g
 ## 📁 Les fichiers du projet
 
 ```
-vole-la-menagerie/
+vol-la-menagerie-roblox/
 ├── README.md                     ← ce fichier
 ├── default.project.json          ← plan du projet pour Rojo (méthode avancée)
 └── src/
@@ -199,7 +202,7 @@ Pour activer la sauvegarde :
 
 Dans le vrai jeu publié, la sauvegarde marche toujours, sans rien faire.
 
-**Ce qui est sauvegardé :** les pièces et les créatures de la base. L'argent pas encore récupéré sur la plaque verte est ajouté automatiquement quand le joueur quitte.
+**Ce qui est sauvegardé :** les pièces, les créatures de la base et l'argent pas encore récupéré sur la plaque verte (il t'attend à ton retour). Les achats Robux ne sont confirmés qu'une fois sauvegardés, et un vol interrompu par une panne de serveur ne duplique ni ne fait disparaître la créature.
 
 ---
 
@@ -295,6 +298,28 @@ Presque tout se règle dans **`Config.luau`**, sans toucher au reste :
 
 ---
 
+## 📝 Reste à faire
+
+Avant de publier le jeu :
+
+- [ ] **Premier test dans Studio** : vérifier qu'aucune erreur rouge n'apparaît dans la Sortie et que la carte se construit.
+- [ ] **Tester le vol à 2 joueurs** (réussite, rattrapage, chrono, base pleine, base verrouillée).
+- [ ] **Tester la sauvegarde** dans un jeu publié (pièces et créatures retrouvées après avoir quitté et rejoint).
+- [ ] **Créer les 3 game passes et les 4 produits** sur le Creator Hub et coller leurs IDs dans `Config.luau` (tous valent `0` aujourd'hui, donc la boutique affiche "Bientôt").
+- [ ] **Régler le serveur à 6 joueurs maximum** (il n'y a que 6 bases ; un 7e joueur n'aurait pas de base).
+- [ ] **Équilibrer** les prix et les gains après quelques parties.
+- [ ] Icône, miniatures et description du jeu.
+
+Limites connues du code actuel :
+
+- Pas de sons ni de musique.
+- Créatures en formes simples (boules), pas de vrais modèles 3D ni d'animations.
+- Pas de gains hors-ligne : les créatures ne rapportent rien quand le joueur n'est pas connecté.
+- Le bouclier et le verrou ne sont pas sauvegardés : ils s'arrêtent si le joueur quitte.
+- Pas encore de tests automatiques ni d'outil de vérification (Selene, StyLua) dans le dépôt.
+
+---
+
 ## 🚀 Idées pour la suite
 
 - Une vraie musique et des sons (achat, vol, alerte).
@@ -309,8 +334,11 @@ Presque tout se règle dans **`Config.luau`**, sans toucher au reste :
 
 ## 🌿 Comment on travaille sur ce dépôt
 
-- La branche `main` contient toujours une version qui marche.
-- **Une branche par fonctionnalité** (`feature/nom-de-la-fonctionnalite`).
-- Chaque branche arrive dans `main` par une **pull request avec une description détaillée** : ce qui change, pourquoi, et comment le tester dans Studio.
-- On fusionne une pull request seulement après l'avoir testée dans Studio.
+On travaille à plusieurs (Tony, Claude et Codex) avec les branches et les pull requests GitHub :
 
+- La branche `main` contient la dernière version **testée dans Studio**.
+- **Une branche par fonctionnalité** (`feature/nom-de-la-fonctionnalite`) ou par correction (`fix/nom-du-probleme`).
+- Chaque branche arrive dans `main` par une **pull request avec une description détaillée** : ce qui change, pourquoi, comment le tester dans Studio, et les points à reprendre.
+- Codex et Claude relisent les pull requests et proposent des corrections.
+- **Tony teste dans Studio avant chaque fusion.**
+- Pour éviter les conflits, **on ne modifie pas le même fichier dans deux branches en même temps**. Avant de commencer, on regarde les pull requests ouvertes pour savoir quels fichiers sont déjà en cours de modification.
