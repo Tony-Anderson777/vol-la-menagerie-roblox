@@ -90,6 +90,9 @@ vol-la-menagerie-roblox/
     │   └── Monetization.luau     ← achats Robux
     └── client/
         └── Client.client.luau    ← ce que le joueur voit à l'écran
+tests/
+├── FakeDataStore.luau            ← faux DataStore (pannes et lenteurs à la demande)
+└── PlayerDataTests.server.luau   ← tests automatiques de la sauvegarde et du vol
 ```
 
 | Fichier | Type dans Studio | Où le mettre dans Studio | Son nom dans Studio |
@@ -99,6 +102,8 @@ vol-la-menagerie-roblox/
 | `src/server/PlayerData.luau` | **ModuleScript** | ServerScriptService | `PlayerData` |
 | `src/server/Monetization.luau` | **ModuleScript** | ServerScriptService | `Monetization` |
 | `src/client/Client.client.luau` | **LocalScript** | StarterPlayer → StarterPlayerScripts | `Client` |
+| `tests/FakeDataStore.luau` *(facultatif)* | **ModuleScript** | ServerStorage → dossier `Tests` | `FakeDataStore` |
+| `tests/PlayerDataTests.server.luau` *(facultatif)* | **Script** | ServerScriptService | `PlayerDataTests` |
 
 > ⚠️ Les noms doivent être **exactement** ceux du tableau (majuscules comprises), sinon les scripts ne se trouvent pas entre eux.
 
@@ -186,6 +191,15 @@ Sauvegarde ton jeu : **Fichier → Enregistrer sur Roblox** (ou Ctrl+S).
 - **Seul :** clique sur **Jouer** (Play, ou F5). Tu apparais dans ta base. Va au tapis roulant et achète une Grenouille Pantoufle avec tes 50 pièces de départ.
 - **À plusieurs (pour tester le vol) :** onglet **Test** → dans "Clients et serveurs", choisis **2 joueurs** → **Démarrer**. Deux fenêtres s'ouvrent : tu peux voler avec l'un et défendre avec l'autre.
 - **Voir les erreurs :** onglet **Affichage → Sortie** (Output). Les messages en rouge sont des erreurs : copie-les et envoie-les à Claude.
+
+### Tests automatiques (sauvegarde et vol)
+
+Ces tests vérifient tout seuls les cas difficiles à provoquer à la main : sauvegarde ratée, joueur qui part au mauvais moment, serveur qui plante pendant un vol. Ils utilisent un **faux DataStore** et une **fausse horloge**, donc ils ne touchent pas à tes vraies données.
+
+1. Ajoute les deux fichiers de `tests/` (voir le tableau plus haut). Pour le dossier : clic sur **+** à côté de ServerStorage → **Folder**, renomme-le `Tests`.
+2. Clique sur **Workspace**, puis dans Propriétés → **Attributs** → **+** : nom `RunTests`, type **boolean**, coché.
+3. Lance le jeu (F5). Dans la **Sortie** : un ✅ par test réussi, un ❌ avec la raison sinon, puis `Résultat : X / X réussis`.
+4. Décoche `RunTests` pour jouer normalement. Les tests ne tournent jamais dans le jeu publié.
 
 ---
 
@@ -316,7 +330,7 @@ Limites connues du code actuel :
 - Créatures en formes simples (boules), pas de vrais modèles 3D ni d'animations.
 - Pas de gains hors-ligne : les créatures ne rapportent rien quand le joueur n'est pas connecté.
 - Le bouclier et le verrou ne sont pas sauvegardés : ils s'arrêtent si le joueur quitte.
-- Pas encore de tests automatiques ni d'outil de vérification (Selene, StyLua) dans le dépôt.
+- Tests automatiques seulement pour la sauvegarde (`PlayerData`), à lancer dans Studio. Pas encore de tests pour le reste du gameplay, ni d'outil de vérification (Selene, StyLua).
 
 ---
 
