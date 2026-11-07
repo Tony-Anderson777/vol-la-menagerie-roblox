@@ -1,6 +1,6 @@
 # 🐾 Vole la Ménagerie
 
-> **État du dépôt : documentation initiale uniquement.** Les scripts Luau et le fichier `default.project.json` décrits ci-dessous ne sont pas encore importés. Les fonctionnalités annoncées dans le document fourni restent à vérifier après ajout du code et tests dans Roblox Studio ; ce dépôt ne contient pas encore de jeu exécutable.
+> **État du dépôt : tout le code du jeu est présent, mais il n'a pas encore été testé dans Roblox Studio.** Si tu vois une erreur en rouge dans la fenêtre Sortie pendant un test, signale-la pour qu'on la corrige.
 
 Un jeu Roblox où tu collectionnes des créatures rigolotes, où elles te font gagner de l'argent... et où les autres joueurs peuvent venir te les voler !
 
