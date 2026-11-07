@@ -1,0 +1,29 @@
+{
+  "name": "VoleLaMenagerie",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Config": {
+        "$path": "src/shared/Config.luau"
+      }
+    },
+    "ServerScriptService": {
+      "GameServer": {
+        "$path": "src/server/GameServer.server.luau"
+      },
+      "PlayerData": {
+        "$path": "src/server/PlayerData.luau"
+      },
+      "Monetization": {
+        "$path": "src/server/Monetization.luau"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Client": {
+          "$path": "src/client/Client.client.luau"
+        }
+      }
+    }
+  }
+}
