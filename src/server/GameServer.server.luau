@@ -395,7 +395,8 @@ for index, center in BASE_CENTERS do
 				uid = nil, -- identifiant unique de la créature (sert à suivre les vols)
 				model = nil,
 				stolenBy = nil,
-				transferring = false, -- vrai pendant l'enregistrement d'un vol réussi
+				transferring = false, -- vrai tant que le vol de cette créature n'est pas enregistré
+				txId = nil, -- identifiant du vol en cours d'enregistrement
 			})
 		end
 	end
@@ -516,7 +517,8 @@ end
 local function baseIncome(base)
 	local total = 0
 	for _, slot in base.slots do
-		if slot.creatureId and not slot.stolenBy then
+		-- Une créature en train d'être volée, ou dont le vol n'est pas encore enregistré, ne rapporte rien
+		if slot.creatureId and not slot.stolenBy and not slot.transferring then
 			total += Config.incomeOf(slot.creatureId, slot.mutation)
 		end
 	end
@@ -598,6 +600,7 @@ local function placeCreature(base, slotIndex, creatureId, mutationId, uid, saveT
 	slot.creatureId = creatureId
 	slot.mutation = mutationId
 	slot.uid = uid or HttpService:GenerateGUID(false)
+	slot.txId = nil
 	slot.model = model
 	slot.stolenBy = nil
 	slot.transferring = false
@@ -619,6 +622,7 @@ local function clearSlot(base, slotIndex, saveToData)
 	slot.creatureId = nil
 	slot.mutation = nil
 	slot.uid = nil
+	slot.txId = nil
 	slot.stolenBy = nil
 	slot.transferring = false
 	if saveToData and base.owner then
@@ -648,68 +652,135 @@ local function applyWalkSpeed(player)
 	end
 end
 
--- Transfert d'une créature volée, dans un ordre qui permet de réparer une coupure :
---  1. on l'enlève au volé et on note le transfert en cours (outgoing), puis on sauvegarde le volé ;
---  2. seulement si ça a marché, on l'ajoute au voleur et on le sauvegarde ;
---  3. ensuite on efface la note chez le volé.
--- Si le serveur s'arrête entre 1 et 2, PlayerData rend la créature au volé à son retour
--- (le voleur ne l'a jamais eue dans sa sauvegarde) : ni duplication, ni perte.
+-- Transfert d'une créature volée. Chaque vol a son propre identifiant de transaction (txId).
+--  1. DÉBIT : on retire la créature au volé et on note debits[txId]. On sauvegarde le volé.
+--     On continue seulement si cette sauvegarde a réussi (ou, s'il part, si SA sauvegarde
+--     finale a réussi) : la disparition du profil ne prouve rien.
+--  2. CRÉDIT : on ajoute la créature au voleur ET le reçu credits[txId], dans la même écriture.
+--     Tant que ce n'est pas enregistré, la créature reste "en transfert" chez le voleur :
+--     elle ne rapporte rien et ne peut être ni vendue ni volée.
+--  3. Si le serveur s'arrête entre 1 et 2, PlayerData (resolveDebits) lit le reçu du voleur au
+--     retour du volé : pas de reçu et voleur parti = la créature est rendue. Ni duplication, ni perte.
+local THIEF_SAVE_ATTEMPTS = 5
+local THIEF_SAVE_RETRY_DELAY = 10
+
+-- Vols dont le crédit n'est pas encore enregistré : [txId] = { ... }
+local pendingTransfers = {}
+
+-- Termine un vol : appelé dès qu'une sauvegarde du voleur (n'importe laquelle, y compris
+-- une autosave plus tard) contient le reçu. Peut être appelé plusieurs fois sans effet.
+local function finalizeTransfer(txId)
+	local transfer = pendingTransfers[txId]
+	if not transfer then
+		return
+	end
+	pendingTransfers[txId] = nil
+	-- Ménage chez le volé : si ce n'est pas sauvegardé, resolveDebits trouvera le reçu.
+	transfer.victimProfile.data.debits[txId] = nil
+	local slot = transfer.thiefBase.slots[transfer.thiefSlotIndex]
+	if transfer.thiefBase.owner == transfer.thief and slot.uid == transfer.uid and slot.txId == txId then
+		slot.transferring = false
+		slot.txId = nil
+		pushState(transfer.thief)
+	end
+end
+
+PlayerData.onSaved(function(profile)
+	for txId, transfer in pendingTransfers do
+		if transfer.thiefProfile == profile and profile.persistedCredits[txId] then
+			finalizeTransfer(txId)
+		end
+	end
+end)
+
 local function commitStolenCreature(victim, victimBase, victimSlotIndex, thief, thiefBase, thiefSlotIndex)
 	local victimSlot = victimBase.slots[victimSlotIndex]
 	local creatureId, mutationId, uid = victimSlot.creatureId, victimSlot.mutation, victimSlot.uid
-
-	local victimData = PlayerData.get(victim)
-	if victimData then
-		victimData.outgoing[uid] = { to = thief.UserId, id = creatureId, mut = mutationId }
+	local name = Config.displayName(creatureId, mutationId)
+	local victimProfile = PlayerData.getProfile(victim)
+	local thiefProfile = PlayerData.getProfile(thief)
+	if not victimProfile or not thiefProfile then
+		placeCreature(victimBase, victimSlotIndex, creatureId, mutationId, uid, false)
+		return false
 	end
-	clearSlot(victimBase, victimSlotIndex, true)
+	local txId = HttpService:GenerateGUID(false)
 
-	-- Le voleur voit tout de suite la créature, mais ne peut ni la vendre ni se la faire voler
-	-- tant que le transfert n'est pas enregistré.
+	-- 1. Débit (en mémoire), puis affichage "en transfert" chez le voleur
+	victimProfile.data.creatures[tostring(victimSlotIndex)] = nil
+	victimProfile.data.debits[txId] = {
+		to = thief.UserId,
+		id = creatureId,
+		mut = mutationId,
+		uid = uid,
+		at = os.time(),
+	}
+	clearSlot(victimBase, victimSlotIndex, false)
 	placeCreature(thiefBase, thiefSlotIndex, creatureId, mutationId, uid, false)
 	local thiefSlot = thiefBase.slots[thiefSlotIndex]
 	thiefSlot.transferring = true
+	thiefSlot.txId = txId
 
-	task.spawn(function()
-		-- Étape 1 : le volé (s'il est parti entre-temps, sa sauvegarde finale contient déjà le transfert)
-		local victimSaved = PlayerData.save(victim) or PlayerData.get(victim) == nil
-		local stillReserved = thiefBase.owner == thief and thiefSlot.uid == uid
-		local thiefData = PlayerData.get(thief)
+	local function thiefStillHasSlot()
+		return thiefBase.owner == thief and thiefSlot.uid == uid
+	end
 
-		if victimSaved and stillReserved and thiefData then
-			-- Étape 2 : le voleur
-			thiefData.creatures[tostring(thiefSlotIndex)] = { id = creatureId, mut = mutationId, uid = uid }
-			thiefSlot.transferring = false
-			if PlayerData.save(thief) then
-				-- Étape 3 : le transfert est terminé
-				local data = PlayerData.get(victim)
-				if data then
-					data.outgoing[uid] = nil
-				end
-			end
-			pushState(thief)
-			return
-		end
-
-		-- Échec : on annule et la créature revient au volé
-		if stillReserved then
+	-- Le vol n'a pas abouti : la créature revient au volé
+	local function cancel()
+		if thiefStillHasSlot() then
 			clearSlot(thiefBase, thiefSlotIndex, false)
 		end
-		local data = PlayerData.get(victim)
-		if data then
-			data.outgoing[uid] = nil
+		if not victimProfile.released then
+			-- Le volé est encore là : on annule le débit dans ses données
+			victimProfile.data.debits[txId] = nil
 			local backSlot = victimBase.owner == victim and findFreeSlot(victimBase, victim)
 			if backSlot then
 				placeCreature(victimBase, backSlot, creatureId, mutationId, uid, true)
 			else
-				table.insert(data.returned, { id = creatureId, mut = mutationId, uid = uid })
+				table.insert(victimProfile.data.returned, { id = creatureId, mut = mutationId, uid = uid })
 			end
-			notify(victim, "😮‍💨 " .. Config.displayName(creatureId, mutationId) .. " est revenu chez toi.", "info")
+			notify(victim, "😮‍💨 " .. name .. " est revenu chez toi.", "info")
+			pushState(victim)
 		end
+		-- Si le volé est parti : soit son débit n'a pas été enregistré (sa sauvegarde a encore
+		-- la créature), soit il l'a été et resolveDebits la lui rendra à son retour.
 		notify(thief, "Le vol n'a pas pu être enregistré, la créature est rendue.", "danger")
 		pushState(thief)
-		pushState(victim)
+	end
+
+	task.spawn(function()
+		-- 1. Le débit doit être enregistré
+		local debitSaved = PlayerData.saveProfile(victimProfile)
+		if not debitSaved or not thiefStillHasSlot() or thiefProfile.released then
+			cancel()
+			return
+		end
+
+		-- 2. Crédit + reçu, dans la même écriture. La créature reste inactive jusqu'à ce
+		-- qu'une sauvegarde réussie contienne le reçu (finalizeTransfer, via PlayerData.onSaved).
+		pendingTransfers[txId] = {
+			thief = thief,
+			thiefProfile = thiefProfile,
+			thiefBase = thiefBase,
+			thiefSlotIndex = thiefSlotIndex,
+			uid = uid,
+			victimProfile = victimProfile,
+		}
+		thiefProfile.data.creatures[tostring(thiefSlotIndex)] = { id = creatureId, mut = mutationId, uid = uid }
+		thiefProfile.data.credits[txId] = { from = victim.UserId, at = os.time() }
+		for attempt = 1, THIEF_SAVE_ATTEMPTS do
+			if PlayerData.saveProfile(thiefProfile) or not pendingTransfers[txId] then
+				return -- enregistré (finalizeTransfer s'en est chargé)
+			end
+			if thiefProfile.released then
+				return -- sa sauvegarde finale a échoué : resolveDebits rendra la créature au volé
+			end
+			task.wait(THIEF_SAVE_RETRY_DELAY)
+		end
+		-- Toujours pas enregistré : l'autosave réessaiera, et finalizeTransfer réactivera la
+		-- créature dès qu'une sauvegarde réussira. Si aucune ne réussit, resolveDebits la rendra au volé.
+		warn("[GameServer] Vol " .. txId .. " : crédit du voleur pas encore enregistré")
 	end)
+	return true
 end
 
 local function endSteal(thief, success, reason)
@@ -736,7 +807,10 @@ local function endSteal(thief, success, reason)
 	local freeSlot = thiefBase and findFreeSlot(thiefBase, thief)
 
 	if success and freeSlot then
-		commitStolenCreature(steal.victim, base, steal.slotIndex, thief, thiefBase, freeSlot)
+		if not commitStolenCreature(steal.victim, base, steal.slotIndex, thief, thiefBase, freeSlot) then
+			pushState(thief)
+			return
+		end
 		notify(thief, "🎉 Tu as volé " .. name .. " !", "success")
 		notify(steal.victim, "😱 " .. thief.DisplayName .. " t'a volé " .. name .. " !", "danger")
 	else
@@ -1137,6 +1211,13 @@ local function onPlayerRemoving(player)
 	end
 	sessions[player] = nil
 	PlayerData.release(player)
+	-- Vols jamais confirmés pour ce voleur : sa sauvegarde finale a tranché
+	-- (réussie : finalizeTransfer est déjà passé ; ratée : resolveDebits rendra la créature).
+	for txId, transfer in pendingTransfers do
+		if transfer.thief == player then
+			pendingTransfers[txId] = nil
+		end
+	end
 end
 
 ---------------------------------------------------------------------

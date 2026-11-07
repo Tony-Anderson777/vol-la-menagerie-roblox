@@ -16,12 +16,23 @@
       },
       "Monetization": {
         "$path": "src/server/Monetization.luau"
+      },
+      "PlayerDataTests": {
+        "$path": "tests/PlayerDataTests.server.luau"
       }
     },
     "StarterPlayer": {
       "StarterPlayerScripts": {
         "Client": {
           "$path": "src/client/Client.client.luau"
+        }
+      }
+    },
+    "ServerStorage": {
+      "Tests": {
+        "$className": "Folder",
+        "FakeDataStore": {
+          "$path": "tests/FakeDataStore.luau"
         }
       }
     }

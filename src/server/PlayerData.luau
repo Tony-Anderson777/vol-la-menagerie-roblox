@@ -17,11 +17,28 @@ local RunService = game:GetService("RunService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
 
+-- Tout ce qui vient de l'extérieur passe par Deps, pour que les tests puissent le remplacer
+-- (faux DataStore qui échoue ou attend, horloge contrôlable). Voir tests/ et PlayerData._setTestDeps.
+local Deps = {
+	store = nil, -- rempli plus bas
+	now = function()
+		return os.time()
+	end,
+	wait = function(seconds)
+		task.wait(seconds)
+	end,
+	isStudio = function()
+		return RunService:IsStudio()
+	end,
+}
+
 local STORE_NAME = "VoleLaMenagerie_v1"
 local AUTOSAVE_INTERVAL = 60 -- secondes
 local LOCK_TIMEOUT = 300 -- un verrou plus vieux que ça est considéré comme abandonné
 local CURRENT_VERSION = 1
 local MAX_RECEIPTS = 50
+local CREDIT_CHECK_AGE = 7 * 24 * 3600 -- un reçu de vol plus vieux que 7 jours peut être vérifié pour nettoyage
+local MAX_CREDIT_CHECKS_PER_LOAD = 10
 
 local JOB_ID = game.JobId
 if JOB_ID == "" then
@@ -35,8 +52,11 @@ local function newDefaultData()
 		creatures = {}, -- ["1"] = { id = "grenouille", mut = "normal", uid = "..." }
 		receipts = {}, -- achats Robux déjà livrés (évite de donner 2 fois)
 		pendingCash = 0, -- argent gagné dans la base mais pas encore récupéré sur la plaque
-		outgoing = {}, -- créatures volées en cours de transfert : [uid] = { to, id, mut }
-		returned = {}, -- créatures à rendre au joueur (transfert de vol interrompu)
+		-- Vols (voir commitStolenCreature dans GameServer). Clé = identifiant de transaction,
+		-- différent de l'identifiant de la créature, car une créature peut être volée plusieurs fois.
+		debits = {}, -- créatures qu'on m'a volées, transfert pas encore confirmé : [txId] = { to, id, mut, uid, at }
+		credits = {}, -- reçus des créatures que j'ai volées : [txId] = { from, at } (enregistré AVEC la créature)
+		returned = {}, -- créatures à me rendre (vol jamais crédité au voleur)
 	}
 end
 
@@ -61,6 +81,19 @@ local function migrate(data)
 			data[key] = value
 		end
 	end
+	-- Ancien format (jamais publié) : "outgoing" remplacé par "debits"
+	if data.outgoing then
+		for uid, transfer in data.outgoing do
+			data.debits[uid] = { to = transfer.to, id = transfer.id, mut = transfer.mut, uid = uid, at = Deps.now() }
+		end
+		data.outgoing = nil
+	end
+	-- Ancien format de reçu (un simple nombre) : on le garde, sans pouvoir le nettoyer
+	for txId, credit in data.credits do
+		if type(credit) == "number" then
+			data.credits[txId] = { at = credit }
+		end
+	end
 	-- Chaque créature a un identifiant unique (sert à suivre les vols)
 	for _, creature in data.creatures do
 		if not creature.uid then
@@ -70,13 +103,12 @@ local function migrate(data)
 	return data
 end
 
-local store = nil
 do
 	local ok, result = pcall(function()
 		return DataStoreService:GetDataStore(STORE_NAME)
 	end)
 	if ok then
-		store = result
+		Deps.store = result
 	else
 		warn("[PlayerData] DataStore indisponible : " .. tostring(result))
 	end
@@ -94,7 +126,7 @@ local function withRetry(attempts, fn)
 		lastError = result
 		warn(string.format("[PlayerData] essai %d/%d raté : %s", attempt, attempts, tostring(result)))
 		if attempt < attempts then
-			task.wait(delaySeconds)
+			Deps.wait(delaySeconds)
 			delaySeconds = math.min(delaySeconds * 2, 16)
 		end
 	end
@@ -103,8 +135,28 @@ end
 
 local PlayerData = {}
 
-local profiles = {} -- [player] = { data = {...}, canSave = bool, released = bool }
+-- [player] = profil :
+--   data             : les données du joueur (la table modifiée par le jeu)
+--   userId, canSave, released, finished, finalOk, writing
+--   persistedCredits : reçus de vol PRÉSENTS DANS LA DERNIÈRE SAUVEGARDE RÉUSSIE
+--                      (≠ data.credits, qui peut contenir un reçu pas encore enregistré)
+local profiles = {}
 local activeWrites = 0
+local saveListeners = {}
+
+local function newProfile(player, data, canSave)
+	return {
+		data = data,
+		userId = player.UserId,
+		canSave = canSave,
+		released = false,
+		finished = false,
+		finalOk = false,
+		writing = false,
+		-- Ce qui vient d'être chargé est par définition enregistré
+		persistedCredits = table.clone(data.credits),
+	}
+end
 
 local function keyFor(userId)
 	return "joueur_" .. tostring(userId)
@@ -113,7 +165,7 @@ end
 -- Libère juste le verrou (quand le joueur part pendant son chargement).
 local function releaseLockOnly(key)
 	withRetry(2, function()
-		store:UpdateAsync(key, function(old)
+		Deps.store:UpdateAsync(key, function(old)
 			if old and old.lock and old.lock.jobId == JOB_ID then
 				old.lock = nil
 				return old
@@ -123,42 +175,81 @@ local function releaseLockOnly(key)
 	end)
 end
 
--- Vérifie les créatures volées dont le transfert a pu être interrompu (voir GameServer).
--- Si le voleur n'a jamais sauvegardé la créature et n'est plus en jeu, elle revient au joueur.
-local function resolveOutgoing(data)
-	for uid, transfer in data.outgoing do
-		local ok, stored = withRetry(2, function()
-			return store:GetAsync(keyFor(transfer.to))
-		end)
+-- Vérifie les vols dont le transfert a pu être interrompu (voir commitStolenCreature dans GameServer).
+-- On regarde le REÇU du voleur (credits[txId]), jamais son inventaire : il a pu revendre
+-- ou se faire voler la créature depuis. Cette vérification peut tourner plusieurs fois sans effet.
+--  * reçu présent            -> le voleur a bien été crédité : on efface la note ;
+--  * voleur encore en jeu    -> on ne sait pas encore : on revérifiera au prochain chargement ;
+--  * pas de reçu, voleur parti -> il ne l'a jamais reçue : la créature revient au volé.
+local function resolveDebits(data)
+	for txId, debit in data.debits do
+		-- Le voleur est peut-être sur ce serveur. Dans ce cas on ne regarde que les reçus
+		-- de sa DERNIÈRE SAUVEGARDE RÉUSSIE : un reçu encore seulement en mémoire ne prouve rien.
+		local localThief = nil
+		for _, profile in profiles do
+			if profile.userId == debit.to then
+				localThief = profile
+			end
+		end
+
+		local received, thiefActive = false, false
+		local ok = true
+		if localThief then
+			received = localThief.persistedCredits[txId] ~= nil
+			thiefActive = true -- s'il n'est pas encore enregistré, on attend
+		else
+			local stored
+			ok, stored = withRetry(2, function()
+				return Deps.store:GetAsync(keyFor(debit.to))
+			end)
+			if ok then
+				local thiefData = stored and stored.data
+				received = thiefData ~= nil and thiefData.credits ~= nil and thiefData.credits[txId] ~= nil
+				local thiefLock = stored and stored.lock
+				thiefActive = thiefLock ~= nil and Deps.now() - thiefLock.time < LOCK_TIMEOUT
+			end
+		end
+
 		if ok then
-			local thiefData = stored and stored.data
-			local received = false
-			if thiefData and thiefData.creatures then
-				for _, creature in thiefData.creatures do
-					if creature.uid == uid then
-						received = true
-						break
-					end
+			if received then
+				data.debits[txId] = nil
+			elseif not thiefActive then
+				table.insert(data.returned, { id = debit.id, mut = debit.mut, uid = debit.uid })
+				data.debits[txId] = nil
+			end
+		end
+	end
+end
+
+-- Nettoie les vieux reçus de vol, mais SEULEMENT quand le volé n'en a plus besoin :
+-- sa sauvegarde ne contient plus le débit correspondant. Un simple délai ne prouve rien
+-- (le volé peut revenir après des mois). Cette vérification peut tourner plusieurs fois sans effet.
+local function pruneCredits(data)
+	local checks = 0
+	for txId, credit in data.credits do
+		if checks >= MAX_CREDIT_CHECKS_PER_LOAD then
+			break
+		end
+		if credit.from and credit.at and Deps.now() - credit.at > CREDIT_CHECK_AGE then
+			checks += 1
+			local ok, stored = withRetry(2, function()
+				return Deps.store:GetAsync(keyFor(credit.from))
+			end)
+			if ok then
+				local victimData = stored and stored.data
+				local stillNeeded = victimData ~= nil and victimData.debits ~= nil and victimData.debits[txId] ~= nil
+				if not stillNeeded then
+					data.credits[txId] = nil
 				end
 			end
-			local thiefLock = stored and stored.lock
-			local thiefActive = thiefLock ~= nil and os.time() - thiefLock.time < LOCK_TIMEOUT
-			if received then
-				data.outgoing[uid] = nil -- le transfert est bien terminé
-			elseif not thiefActive then
-				-- Le voleur ne l'a jamais reçue : on la rend
-				table.insert(data.returned, { id = transfer.id, mut = transfer.mut, uid = uid })
-				data.outgoing[uid] = nil
-			end
-			-- Sinon le voleur est encore en jeu : on revérifiera au prochain chargement.
 		end
 	end
 end
 
 -- Charge les données. Renvoie la table de données, ou nil si le joueur a été expulsé.
 function PlayerData.load(player)
-	if not store then
-		profiles[player] = { data = migrate(newDefaultData()), canSave = false, released = false }
+	if not Deps.store then
+		profiles[player] = newProfile(player, migrate(newDefaultData()), false)
 		return profiles[player].data
 	end
 
@@ -166,17 +257,17 @@ function PlayerData.load(player)
 	for attempt = 1, 5 do
 		local lockedByOther = false
 		local ok, stored = withRetry(3, function()
-			return store:UpdateAsync(key, function(old)
+			return Deps.store:UpdateAsync(key, function(old)
 				lockedByOther = false
 				old = old or { data = newDefaultData() }
 				local lock = old.lock
 				-- (dans Studio on ignore le verrou, sinon un test arrêté brutalement bloquerait le suivant)
-				local isOtherServer = lock and lock.jobId ~= JOB_ID and not RunService:IsStudio()
-				if isOtherServer and os.time() - lock.time < LOCK_TIMEOUT then
+				local isOtherServer = lock and lock.jobId ~= JOB_ID and not Deps.isStudio()
+				if isOtherServer and Deps.now() - lock.time < LOCK_TIMEOUT then
 					lockedByOther = true
 					return nil -- on n'écrit rien : un autre serveur utilise ces données
 				end
-				old.lock = { jobId = JOB_ID, time = os.time() }
+				old.lock = { jobId = JOB_ID, time = Deps.now() }
 				return old
 			end)
 		end)
@@ -190,10 +281,10 @@ function PlayerData.load(player)
 		end
 
 		if not ok then
-			if RunService:IsStudio() then
+			if Deps.isStudio() then
 				-- Dans Studio sans "Accès aux services API", on joue quand même, sans sauvegarde.
 				warn("[PlayerData] Pas de sauvegarde dans ce test Studio (active l'accès aux services API).")
-				profiles[player] = { data = migrate(newDefaultData()), canSave = false, released = false }
+				profiles[player] = newProfile(player, migrate(newDefaultData()), false)
 				return profiles[player].data
 			end
 			player:Kick("Impossible de charger ta progression. Reviens dans un instant !")
@@ -207,17 +298,18 @@ function PlayerData.load(player)
 				player:Kick("Erreur de données. Reviens dans un instant !")
 				return nil
 			end
-			resolveOutgoing(data)
+			resolveDebits(data)
 			if not player.Parent then
 				releaseLockOnly(key)
 				return nil
 			end
-			profiles[player] = { data = data, canSave = true, released = false }
+			pruneCredits(data)
+			profiles[player] = newProfile(player, data, true)
 			return data
 		end
 
 		-- Un autre serveur termine peut-être sa sauvegarde : on attend un peu.
-		task.wait(5)
+		Deps.wait(5)
 	end
 
 	player:Kick("Ta progression est encore en train de se sauvegarder. Reviens dans quelques secondes !")
@@ -229,51 +321,103 @@ function PlayerData.get(player)
 	return profile and profile.data
 end
 
+-- Attend la fin de la sauvegarde finale et renvoie si elle a réussi.
+local function waitForFinal(profile)
+	while not profile.finished do
+		Deps.wait(0.1)
+	end
+	return profile.finalOk == true
+end
+
 -- Écrit les données. Les écritures d'un même joueur passent une par une, dans l'ordre,
 -- et plus rien n'est écrit après la sauvegarde finale (celle qui libère le verrou).
 -- Renvoie true seulement si les données sont vraiment enregistrées.
-local function write(profile, userId, releaseLock)
-	if not profile.canSave or not store then
+-- Si le joueur est en train de partir, on attend sa sauvegarde finale et on renvoie
+-- SON résultat (elle contient les mêmes données, puisqu'elle part de la même table).
+local notifySaved -- défini plus bas
+
+local function write(profile, releaseLock)
+	if not profile.canSave or not Deps.store then
+		-- Sans sauvegarde (test Studio sans accès API) : tout compte comme "enregistré"
+		profile.persistedCredits = table.clone(profile.data.credits)
+		notifySaved(profile)
 		return true
 	end
-	if profile.finished or (profile.released and not releaseLock) then
-		return false
+	if not releaseLock and profile.released then
+		return waitForFinal(profile)
 	end
 	activeWrites += 1
 	while profile.writing do
-		task.wait(0.1)
+		Deps.wait(0.1)
 	end
-	if profile.finished or (profile.released and not releaseLock) then
+	if not releaseLock and profile.released then
 		activeWrites -= 1
-		return false
+		return waitForFinal(profile)
+	end
+	if releaseLock and profile.finished then
+		activeWrites -= 1
+		return profile.finalOk == true
 	end
 	profile.writing = true
 
 	local aborted = false
+	local creditsInWrite = nil
 	local ok = withRetry(3, function()
-		store:UpdateAsync(keyFor(userId), function(old)
+		Deps.store:UpdateAsync(keyFor(profile.userId), function(old)
 			aborted = false
-			if old and old.lock and old.lock.jobId ~= JOB_ID and not RunService:IsStudio() then
+			-- Les reçus exactement présents dans CETTE écriture
+			creditsInWrite = table.clone(profile.data.credits)
+			if old and old.lock and old.lock.jobId ~= JOB_ID and not Deps.isStudio() then
 				aborted = true
 				return nil -- un autre serveur a pris la main : on n'écrase rien
 			end
 			local newLock = nil
 			if not releaseLock then
-				newLock = { jobId = JOB_ID, time = os.time() }
+				newLock = { jobId = JOB_ID, time = Deps.now() }
 			end
 			return { data = profile.data, lock = newLock }
 		end)
 	end)
+	local success = ok and not aborted
+	if success and creditsInWrite then
+		profile.persistedCredits = creditsInWrite
+	end
 
 	if releaseLock then
+		profile.finalOk = success
 		profile.finished = true
 	end
 	profile.writing = false
 	activeWrites -= 1
 	if aborted then
-		warn("[PlayerData] Sauvegarde refusée : un autre serveur a pris les données de " .. userId)
+		warn("[PlayerData] Sauvegarde refusée : un autre serveur a pris les données de " .. profile.userId)
 	end
-	return ok and not aborted
+	if success then
+		notifySaved(profile)
+	end
+	return success
+end
+
+notifySaved = function(profile)
+	for _, listener in saveListeners do
+		task.spawn(listener, profile)
+	end
+end
+
+-- Appelle fn(profile) après chaque sauvegarde réussie (y compris l'autosave et la finale).
+-- Sert au vol : une créature en transfert est réactivée dès que son reçu est enregistré.
+function PlayerData.onSaved(fn)
+	table.insert(saveListeners, fn)
+end
+
+-- Le "profil" d'un joueur : garde ses données même après son départ, le temps de finir
+-- une opération en cours (utilisé par le vol). Ne pas le garder plus longtemps.
+function PlayerData.getProfile(player)
+	return profiles[player]
+end
+
+function PlayerData.saveProfile(profile)
+	return write(profile, false)
 end
 
 function PlayerData.save(player)
@@ -281,7 +425,7 @@ function PlayerData.save(player)
 	if not profile then
 		return false
 	end
-	return write(profile, player.UserId, false)
+	return write(profile, false)
 end
 
 -- Sauvegarde une dernière fois et libère le verrou (quand le joueur part).
@@ -291,7 +435,7 @@ function PlayerData.release(player)
 		return
 	end
 	profile.released = true
-	write(profile, player.UserId, true)
+	write(profile, true)
 	if profiles[player] == profile then
 		profiles[player] = nil
 	end
@@ -343,5 +487,24 @@ function PlayerData.start()
 		end
 	end)
 end
+
+---------------------------------------------------------------------
+-- Pour les tests uniquement (voir tests/PlayerDataTests.server.luau)
+---------------------------------------------------------------------
+function PlayerData._setTestDeps(overrides)
+	for key, value in overrides do
+		Deps[key] = value
+	end
+end
+
+function PlayerData._reset()
+	table.clear(profiles)
+	table.clear(saveListeners)
+	activeWrites = 0
+end
+
+PlayerData._resolveDebits = resolveDebits
+PlayerData._pruneCredits = pruneCredits
+PlayerData._keyFor = keyFor
 
 return PlayerData
